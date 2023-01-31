@@ -1,0 +1,146 @@
+#!/bin/bash
+
+PATH="/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"
+export PATH
+PROGNAME=`basename $0`
+REVISION="2023-01-31.1"
+
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+STATE_DEPENDENT=4
+
+function print_usage() {
+	echo "Usage: $PROGNAME -p|--path=<path to folder> [-d|--detailed] [-s|--sudo]"
+	echo ""
+	echo "    -p|--path      Path to folder to count"
+	echo "    -d|--detailed  (optional) Show sizes for each sub-directory"
+	echo "    -d|--sudo      (optional) Use sudo to access folders."
+	echo ""
+	echo "To use sudo you need to add following to sudoers"
+	echo "    icinga ALL = (ALL) NOPASSWD: /usr/bin/du,/usr/bin/find"
+}
+
+function print_revision() {
+	echo "$1 v$2"
+}
+
+function print_help() {
+	print_revision $PROGNAME $REVISION
+	echo ""
+	echo "This plugin checks folder size"
+	echo ""
+	print_usage
+	echo ""
+}
+
+path=
+detailed=no
+use_sudo=no
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-h|--help)     print_help; exit $STATE_OK;;
+		-V|--version)  print_revision $PROGNAME $REVISION; exit $STATE_OK;;
+		-p|--path)     path="$2"; shift; shift;;
+		-d|--detailed) detailed=yes; shift;;
+		-s|--sudo)     use_sudo=yes; shift;;
+		-*|--*)        echo "Unknown argument $1"; print_help; exit $STATE_UNKNOWN;;
+		*) shift;;
+	esac
+done
+
+if [ -z "$path" ]; then
+	echo "[CRITICAL] path not set"
+	exit $STATE_CRITICAL
+fi
+
+if [ ! -d "$path" ]; then
+	echo "[CRITICAL] '$path' is not a dir"
+	exit $STATE_CRITICAL	
+fi
+
+platform='unknown'
+unamestr=$(uname)
+if [[ "$unamestr" == 'Linux' ]]; then
+	platform='linux'
+elif [[ "$unamestr" == 'FreeBSD' ]]; then
+	platform='freebsd'
+else
+	echo "[UNKNOWN] Unsupported platform: $unamestr"
+	exit $STATE_UNKNOWN
+fi
+
+function _format_size() {
+	size=$1
+
+	if [ $size -ge 1073741824 ]; then
+		size="$(awk 'BEGIN {printf "%.2f",'$size'/1073741824}') GB"
+	elif [ $size -ge 1048576 ]; then
+		size="$(awk 'BEGIN {printf "%.2f",'$size'/1048576}') MB"
+	elif [ $size -ge 1024 ]; then
+		size="$(awk 'BEGIN {printf "%.2f",'$size'/1024}') KB"
+	fi
+
+	echo $size
+}
+
+function _dir_size() {
+	path=$1
+
+	if [ "$use_sudo" == "yes" ]; then
+		echo $(sudo du -sk "$path" | cut -f 1)
+	else
+		echo $(du -sk "$path" | cut -f 1)
+	fi
+}
+
+function _list_items() {
+	path=$1
+	type=$2
+		
+	if [ "$platform" == "linux" ]; then
+		depth="-mindepth 1 -maxdepth 1"
+	elif [ "$platform" == "freebsd" ]; then
+		depth="-depth 1"
+	fi
+
+	if [ "$use_sudo" == "yes" ]; then
+		sudo find "$path" $depth -type $type | sort -V
+	else 
+		find "$path" $depth -type $type | sort -V
+	fi
+}
+
+message=""
+total_size=0
+data=
+
+if [ "$detailed" == "yes" ]; then
+	message="\n"
+
+	while IFS= read folder; do
+		size_k=$(_dir_size "$folder")
+		size=$(($size_k * 1024))
+		total_size=$(($total_size + $size))
+		name="`basename "$folder"|tr -s ' ' '_'`"
+		message="$message\_ [OK] $(basename "$folder"): $(_format_size $size)\n"
+		data="$data $name=$size;0;0;0"
+	done < <(_list_items "$path" d)
+
+	size=0
+	while IFS= read file; do
+		size_k=$(_dir_size "$file")
+		size=$(($size + $size_k * 1024))
+		total_size=$(($total_size + $size_k * 1024))
+	done < <(_list_items "$path" f)
+
+	message="$message\_ [OK] [files]: $(_format_size $size)\n"
+else
+	total_size_k=$(_dir_size "$path")
+	total_size=$(($total_size_k * 1024))
+fi
+
+echo -e "[OK] Directory \"$path\" size: $(_format_size $total_size)$message|_total=$total_size;0;0;0$data"
+exit $STATE_OK
